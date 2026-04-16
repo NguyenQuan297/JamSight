@@ -189,87 +189,85 @@ def analyze_audio(wav_path: str) -> dict:
 # ONNX-based chord detection
 # ──────────────────────────────────────────────
 
-def _extract_window_features(notes_in_window: list[dict]) -> np.ndarray | None:
-    """Extract 36-dim features from a list of note dicts (pitch, velocity, start, end)."""
-    if len(notes_in_window) < 4:
+def _extract_audio_window_features(
+    y_full: np.ndarray, sr: int, t_start: float, window: float,
+    crepe_time: np.ndarray, crepe_freq: np.ndarray, crepe_conf: np.ndarray,
+) -> np.ndarray | None:
+    """Extract 36-dim audio features matching the training pipeline.
+
+    [0:12]  CREPE-based chroma (neural pitch detection)
+    [12:24] librosa CQT chroma (spectrogram-based)
+    [24:36] Spectral: centroid, bandwidth, rolloff, ZCR, 8 MFCCs
+    """
+    import librosa
+
+    start_sample = int(t_start * sr)
+    end_sample = start_sample + int(window * sr)
+    y_win = y_full[start_sample:end_sample]
+
+    if len(y_win) < sr * 0.5:
         return None
 
-    pitches = np.array([n["pitch"] for n in notes_in_window])
-    vels = np.array([n["velocity"] for n in notes_in_window], dtype=float)
-    durs = np.array([n["end"] - n["start"] for n in notes_in_window])
+    # 1. CREPE-based chroma (12-dim)
+    mask = (crepe_time >= t_start) & (crepe_time < t_start + window) & (crepe_conf > 0.6)
+    win_freq = crepe_freq[mask]
+    win_conf = crepe_conf[mask]
 
-    # Chroma (12-dim)
-    chroma = np.zeros(12)
-    for p in pitches:
-        chroma[p % 12] += 1
-    total = chroma.sum()
-    if total > 0:
-        chroma /= total
+    crepe_chroma = np.zeros(12)
+    if len(win_freq) >= 3:
+        for f, c in zip(win_freq, win_conf):
+            if f > 0:
+                midi_note = int(round(librosa.hz_to_midi(f)))
+                crepe_chroma[midi_note % 12] += c
+        total = crepe_chroma.sum()
+        if total > 0:
+            crepe_chroma /= total
+    else:
+        return None
 
-    # Velocity-weighted chroma (12-dim)
-    vchroma = np.zeros(12)
-    for n, v in zip(notes_in_window, vels):
-        vchroma[n["pitch"] % 12] += v
-    vtotal = vchroma.sum()
-    if vtotal > 0:
-        vchroma /= vtotal
+    # 2. librosa CQT chroma (12-dim)
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
+    chroma_mean = chroma_cqt.mean(axis=1)
+    cmax = chroma_mean.max()
+    if cmax > 0:
+        chroma_mean /= cmax
 
-    # Piano features (6-dim)
-    lh = pitches[pitches < 60]
-    rh = pitches[pitches >= 60]
-    piano_feats = np.array([
-        len(lh) / (len(pitches) + 1e-8),
-        len(rh) / (len(pitches) + 1e-8),
-        (pitches.max() - pitches.min()) / 48.0,
-        (durs > 0.4).mean(),
-        vels.std() / 64.0,
-        len(set(pitches % 12)) / 12.0,
-    ])
+    # 3. Spectral features (12-dim)
+    centroid = librosa.feature.spectral_centroid(y=y_win, sr=sr).mean() / 8000
+    bandwidth = librosa.feature.spectral_bandwidth(y=y_win, sr=sr).mean() / 4000
+    rolloff = librosa.feature.spectral_rolloff(y=y_win, sr=sr).mean() / 8000
+    zcr = librosa.feature.zero_crossing_rate(y_win).mean()
+    mfccs = librosa.feature.mfcc(y=y_win, sr=sr, n_mfcc=8).mean(axis=1)
+    mfccs = np.clip((mfccs + 50) / 100, 0, 1)
 
-    # Temporal features (6-dim)
-    starts = np.array([n["start"] for n in notes_in_window])
-    intervals = np.diff(starts) if len(starts) > 1 else np.array([0.0])
-    temporal = np.array([
-        np.clip(intervals.mean(), 0, 1),
-        np.clip(intervals.std(), 0, 1),
-        (intervals < 0.08).mean(),
-        np.clip(durs.mean(), 0, 2) / 2.0,
-        np.clip(durs.std(), 0, 1),
-        np.clip(len(notes_in_window) / 30.0, 0, 1),
-    ])
+    spectral = np.array([centroid, bandwidth, rolloff, zcr, *mfccs])
+    spectral = np.clip(spectral, 0, 1).astype(np.float32)
 
-    return np.concatenate([chroma, vchroma, piano_feats, temporal]).astype(np.float32)
+    return np.concatenate([crepe_chroma, chroma_mean, spectral]).astype(np.float32)
 
 
 def _detect_chords_onnx(y: np.ndarray, sr: int) -> list[str]:
-    """Detect chords using trained ONNX model on audio windows."""
+    """Detect chords using ONNX model with audio-based features.
+
+    Uses the same feature extraction as the training pipeline:
+    CREPE chroma + CQT chroma + spectral features = 36-dim.
+    """
     import librosa
 
-    # Detect onsets to get note-like events
-    onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=512)
-    onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=512)
+    # Run CREPE/pyin for pitch detection (same as training)
+    try:
+        import crepe
+        crepe_time, crepe_freq, crepe_conf, _ = crepe.predict(
+            y, sr, viterbi=True, step_size=50
+        )
+    except ImportError:
+        f0, voiced, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr,
+                                      hop_length=int(sr * 0.05))
+        crepe_time = np.arange(len(f0)) * 0.05
+        crepe_freq = np.where(np.isnan(f0), 0, f0)
+        crepe_conf = voiced.astype(float)
 
-    # Use pyin for pitch detection
-    f0, voiced_flag, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr, hop_length=512)
-    f0_times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=512)
-
-    # Build pseudo-notes from pitch detection
-    notes = []
-    for i in range(len(f0) - 1):
-        if voiced_flag[i] and not np.isnan(f0[i]):
-            pitch = int(round(librosa.hz_to_midi(f0[i])))
-            if 36 <= pitch <= 96:
-                notes.append({
-                    "pitch": pitch,
-                    "velocity": 80,
-                    "start": float(f0_times[i]),
-                    "end": float(f0_times[i + 1]),
-                })
-
-    if len(notes) < 8:
-        return _detect_chords_heuristic_from_chroma(y, sr)
-
-    # Sliding window analysis
+    # Sliding window: extract audio features directly
     duration = len(y) / sr
     window_sec = 2.0
     hop_sec = 1.0
@@ -278,9 +276,10 @@ def _detect_chords_onnx(y: np.ndarray, sr: int) -> list[str]:
 
     t = 0.0
     while t + window_sec <= duration:
-        win_notes = [n for n in notes if n["start"] >= t and n["start"] < t + window_sec]
-        feat = _extract_window_features(win_notes)
-
+        feat = _extract_audio_window_features(
+            y, sr, t, window_sec,
+            crepe_time, crepe_freq, crepe_conf,
+        )
         if feat is not None:
             chord, conf = _predictor.predict(feat)
             if conf > 0.3 and chord != prev:
@@ -288,7 +287,7 @@ def _detect_chords_onnx(y: np.ndarray, sr: int) -> list[str]:
                 prev = chord
         t += hop_sec
 
-    return chords if chords else ["C"]
+    return chords if chords else _detect_chords_heuristic_from_chroma(y, sr)
 
 
 def _detect_chords_heuristic_from_chroma(y: np.ndarray, sr: int) -> list[str]:

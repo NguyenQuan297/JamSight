@@ -60,21 +60,26 @@ def idx_to_label(idx: int) -> str:
 # ──────────────────────────────────────────────
 
 class PianoChordDataset(Dataset):
-    """Dataset from piano_dataset.json samples."""
+    """Dataset from piano split JSON files. Supports online augmentation."""
 
-    def __init__(self, samples: list[dict]):
-        self.X = torch.tensor(
-            [s["features"] for s in samples], dtype=torch.float32
-        )
+    def __init__(self, samples: list[dict], augment: bool = False):
+        self.X = [np.array(s["features"], dtype=np.float32) for s in samples]
         self.y = torch.tensor(
             [s["label_idx"] for s in samples], dtype=torch.long
         )
+        self.augmenter = None
+        if augment:
+            from augment import PianoAugmentation
+            self.augmenter = PianoAugmentation()
 
     def __len__(self):
         return len(self.X)
 
     def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+        x = torch.tensor(self.X[idx], dtype=torch.float32)
+        if self.augmenter is not None:
+            x = self.augmenter(x)
+        return x, self.y[idx]
 
 
 # ──────────────────────────────────────────────
@@ -116,14 +121,29 @@ class PianoMLP(nn.Module):
 # Training
 # ──────────────────────────────────────────────
 
-def load_and_split(dataset_path: str) -> tuple[list, list, list]:
-    """Load dataset and split by track (not random) to avoid data leakage."""
+def load_split(split: str) -> tuple[list[dict], dict]:
+    """Load a pre-split dataset file (piano_train.json, piano_val.json, etc.)."""
+    path = DATA_DIR / f"piano_{split}.json"
+    if not path.exists():
+        # Fallback to single-file format
+        single = DATA_DIR / "piano_dataset.json"
+        if single.exists():
+            logger.info(f"Split file not found, falling back to {single}")
+            return _fallback_split(str(single), split)
+        raise FileNotFoundError(
+            f"Dataset not found: {path}. Run prepare_data.py first."
+        )
+
+    with open(path) as f:
+        data = json.load(f)
+    return data["samples"], data
+
+
+def _fallback_split(dataset_path: str, split: str) -> tuple[list, dict]:
+    """Fallback: split single dataset file by track."""
     with open(dataset_path) as f:
         data = json.load(f)
-
     samples = data["samples"]
-
-    # Track-level split
     tracks = list(set(s["track_id"] for s in samples))
     rng = np.random.default_rng(42)
     rng.shuffle(tracks)
@@ -131,11 +151,12 @@ def load_and_split(dataset_path: str) -> tuple[list, list, list]:
     val_tracks = set(tracks[:int(n * 0.15)])
     test_tracks = set(tracks[int(n * 0.15):int(n * 0.25)])
 
-    train_s = [s for s in samples if s["track_id"] not in val_tracks | test_tracks]
-    val_s = [s for s in samples if s["track_id"] in val_tracks]
-    test_s = [s for s in samples if s["track_id"] in test_tracks]
-
-    return train_s, val_s, test_s
+    if split == "train":
+        return [s for s in samples if s["track_id"] not in val_tracks | test_tracks], data
+    elif split == "val":
+        return [s for s in samples if s["track_id"] in val_tracks], data
+    else:
+        return [s for s in samples if s["track_id"] in test_tracks], data
 
 
 def make_weighted_sampler(samples: list[dict], num_classes: int) -> WeightedRandomSampler:
@@ -148,29 +169,26 @@ def make_weighted_sampler(samples: list[dict], num_classes: int) -> WeightedRand
 
 def train_model(config: dict) -> float:
     """Train one model with given config. Returns best validation accuracy."""
-    dataset_path = DATA_DIR / "piano_dataset.json"
-    if not dataset_path.exists():
-        raise FileNotFoundError(f"Dataset not found: {dataset_path}. Run prepare_data.py first.")
-
-    with open(dataset_path) as f:
-        data = json.load(f)
-    num_classes = data["n_classes"]
-
-    train_s, val_s, test_s = load_and_split(str(dataset_path))
-    logger.info(f"Split: train={len(train_s)}, val={len(val_s)}, test={len(test_s)}")
+    train_s, train_meta = load_split("train")
+    val_s, _ = load_split("val")
+    num_classes = train_meta.get("n_classes", NUM_CLASSES)
+    feature_dim = train_meta.get("feature_dim", 36)
+    logger.info(f"Split: train={len(train_s)}, val={len(val_s)}, feature_dim={feature_dim}")
 
     # Weighted sampler
     sampler = make_weighted_sampler(train_s, num_classes)
     train_loader = DataLoader(
-        PianoChordDataset(train_s), batch_size=config.get("batch_size", 64),
+        PianoChordDataset(train_s, augment=config.get("augment", True)),
+        batch_size=config.get("batch_size", 64),
         sampler=sampler, num_workers=0,
     )
     val_loader = DataLoader(
-        PianoChordDataset(val_s), batch_size=256, shuffle=False, num_workers=0,
+        PianoChordDataset(val_s, augment=False),
+        batch_size=256, shuffle=False, num_workers=0,
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = PianoMLP(in_dim=data["feature_dim"], num_classes=num_classes).to(device)
+    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=1e-4,
     )
@@ -234,9 +252,9 @@ def train_model(config: dict) -> float:
             patience_counter = 0
             MODEL_DIR.mkdir(parents=True, exist_ok=True)
             torch.save(
-                {"state": model.state_dict(), "classes": data["classes"],
+                {"state": model.state_dict(), "classes": train_meta.get("classes", CLASSES),
                  "config": config, "best_acc": best_acc,
-                 "feature_dim": data["feature_dim"]},
+                 "feature_dim": feature_dim},
                 str(model_path),
             )
         else:

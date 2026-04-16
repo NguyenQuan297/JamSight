@@ -1,12 +1,17 @@
-"""Build piano chord classification dataset from MAESTRO MIDI files.
+"""Build piano chord dataset from REAL AUDIO (MAPS) + MIDI fallback.
 
-Pipeline: MIDI files → 2-second windows → 36-dim feature vectors → JSON dataset
+Key difference from v1: features come from audio signal processing, not MIDI.
+This closes the domain gap between training data and user video recordings.
 
-Features (36-dim):
-  [0:12]  Chroma histogram (pitch class distribution)
-  [12:24] Velocity-weighted chroma
-  [24:30] Piano-specific: hand balance, range, density, sustain, dynamics, richness
-  [30:36] Temporal: note intervals, durations, run detection
+Feature vector (36-dim):
+  [0:12]  CREPE pitch-based chroma (from neural pitch detection)
+  [12:24] librosa CQT chroma (from raw audio spectrogram)
+  [24:36] Spectral features: centroid, bandwidth, rolloff, ZCR, 8 MFCCs
+
+Data sources:
+  1. MAPS (primary)    — real piano audio + aligned MIDI → ground truth chords
+  2. MAESTRO (fallback) — MIDI only → synthesize features (weaker, but available)
+  3. Synthetic          — augment rare chord classes
 """
 
 import argparse
@@ -21,7 +26,6 @@ logger = logging.getLogger(__name__)
 
 DATA = Path(__file__).parent / "data"
 
-# 96 chord classes = 12 roots x 8 types
 ROOTS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 CHORD_TYPES = ["maj", "min", "7", "maj7", "min7", "dim", "aug", "sus4"]
 CLASSES = [
@@ -29,145 +33,202 @@ CLASSES = [
     for r in ROOTS for t in CHORD_TYPES
 ]
 LABEL_TO_IDX = {c: i for i, c in enumerate(CLASSES)}
-
-# Piano MIDI note range
-PIANO_LO = 48  # C3
-PIANO_HI = 96  # C7
+FEATURE_DIM = 36
 
 
-def midi_to_windows(midi_path: str, window_sec: float = 2.0,
-                    hop_sec: float = 0.5) -> list[dict]:
-    """Parse one MIDI file into 2-second analysis windows.
+# ══════════════════════════════════════════════════════════════════
+# Source 1: MAPS — real audio + aligned MIDI (solves domain gap)
+# ══════════════════════════════════════════════════════════════════
 
-    Each window produces a 36-dim feature vector + estimated chord label.
-    """
+def process_maps(maps_dir: Path) -> list[dict]:
+    """Process MAPS dataset: real piano audio → features, MIDI → chord labels."""
+    samples = []
+
+    for piano_dir in sorted(maps_dir.iterdir()):
+        if not piano_dir.is_dir():
+            continue
+
+        wav_files = list(piano_dir.rglob("*.wav"))
+        if not wav_files:
+            continue
+
+        piano_type = _get_maps_piano_type(piano_dir.name)
+        logger.info(f"Processing MAPS/{piano_dir.name} ({piano_type}): {len(wav_files)} files")
+
+        for wav_path in wav_files:
+            midi_path = wav_path.with_suffix(".mid")
+            if not midi_path.exists():
+                midi_path = wav_path.with_suffix(".midi")
+            if not midi_path.exists():
+                continue
+
+            file_samples = _process_maps_file(str(wav_path), str(midi_path), piano_type)
+            samples.extend(file_samples)
+
+        logger.info(f"  → {len(samples)} total samples so far")
+
+    return samples
+
+
+def _process_maps_file(audio_path: str, midi_path: str, piano_type: str) -> list[dict]:
+    """Extract features from real audio, chord labels from aligned MIDI."""
+    import librosa
     import pretty_midi
 
     try:
-        midi = pretty_midi.PrettyMIDI(str(midi_path))
+        y, sr = librosa.load(audio_path, sr=16000, mono=True)
     except Exception as e:
-        logger.debug(f"Skipping {midi_path}: {e}")
+        logger.debug(f"Skipping {audio_path}: {e}")
         return []
 
-    # Collect all piano notes (program 0-7 = keyboard instruments)
-    notes = []
-    for inst in midi.instruments:
-        if inst.program < 8 and not inst.is_drum:
-            notes.extend(inst.notes)
-
-    if len(notes) < 8:
+    try:
+        midi = pretty_midi.PrettyMIDI(midi_path)
+    except Exception:
         return []
 
-    notes.sort(key=lambda n: n.start)
-    duration = midi.get_end_time()
-    windows = []
+    # CREPE pitch detection
+    crepe_time, crepe_freq, crepe_conf = _run_crepe(y, sr)
+
+    duration = len(y) / sr
+    window_sec = 2.0
+    hop_sec = 0.5
+    samples = []
 
     t = 0.0
     while t + window_sec <= duration:
-        win_notes = [
-            n for n in notes
-            if n.start >= t and n.start < t + window_sec
-            and PIANO_LO <= n.pitch <= PIANO_HI
-        ]
+        # Ground truth chord from aligned MIDI
+        chord = _midi_window_to_chord(midi, t, t + window_sec)
+        if chord not in LABEL_TO_IDX:
+            t += hop_sec
+            continue
 
-        if len(win_notes) >= 4:
-            feat = extract_features(win_notes)
-            chord = estimate_chord(win_notes)
-            if feat is not None and chord in LABEL_TO_IDX:
-                windows.append({
-                    "features": feat.tolist(),
-                    "label_idx": LABEL_TO_IDX[chord],
-                    "label_str": chord,
-                    "track_id": Path(midi_path).stem,
-                    "t_start": round(t, 2),
-                })
+        # Audio features
+        feat = _extract_audio_features(
+            y, sr, t, window_sec,
+            crepe_time, crepe_freq, crepe_conf,
+        )
+        if feat is not None:
+            samples.append({
+                "features": feat.tolist(),
+                "label_idx": LABEL_TO_IDX[chord],
+                "label_str": chord,
+                "track_id": Path(audio_path).stem,
+                "source": "maps",
+                "piano_type": piano_type,
+            })
         t += hop_sec
 
-    return windows
+    return samples
 
 
-def extract_features(notes: list) -> np.ndarray | None:
-    """Extract 36-dim piano feature vector from a window of MIDI notes."""
-    if not notes:
+def _run_crepe(y: np.ndarray, sr: int) -> tuple:
+    """Run CREPE pitch detection, fallback to pyin if unavailable."""
+    try:
+        import crepe
+        time, freq, conf, _ = crepe.predict(y, sr, viterbi=True, step_size=50)
+        return time, freq, conf
+    except ImportError:
+        logger.info("CREPE not available, using librosa pyin")
+        import librosa
+        f0, voiced, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr,
+                                      hop_length=int(sr * 0.05))
+        time = np.arange(len(f0)) * 0.05
+        freq = np.where(np.isnan(f0), 0, f0)
+        conf = voiced.astype(float)
+        return time, freq, conf
+
+
+def _extract_audio_features(
+    y: np.ndarray, sr: int, t_start: float, window: float,
+    crepe_time: np.ndarray, crepe_freq: np.ndarray, crepe_conf: np.ndarray,
+) -> np.ndarray | None:
+    """Extract 36-dim feature vector from an audio window.
+
+    [0:12]  CREPE-based chroma (neural pitch → pitch class distribution)
+    [12:24] librosa CQT chroma (spectrogram-based, complementary)
+    [24:36] Spectral: centroid, bandwidth, rolloff, ZCR, 8 MFCCs
+    """
+    import librosa
+
+    # Slice audio window
+    start_sample = int(t_start * sr)
+    end_sample = start_sample + int(window * sr)
+    y_win = y[start_sample:end_sample]
+
+    if len(y_win) < sr * 0.5:  # too short
         return None
 
-    pitches = np.array([n.pitch for n in notes])
-    vels = np.array([n.velocity for n in notes], dtype=float)
-    durs = np.array([n.end - n.start for n in notes])
+    # 1. CREPE-based chroma (12-dim)
+    mask = (crepe_time >= t_start) & (crepe_time < t_start + window) & (crepe_conf > 0.6)
+    win_freq = crepe_freq[mask]
+    win_conf = crepe_conf[mask]
 
-    # [0:12] Chroma histogram
-    chroma = np.zeros(12)
-    for p in pitches:
-        chroma[p % 12] += 1
-    total = chroma.sum()
-    if total > 0:
-        chroma /= total
+    crepe_chroma = np.zeros(12)
+    if len(win_freq) >= 3:
+        for f, c in zip(win_freq, win_conf):
+            if f > 0:
+                midi_note = int(round(librosa.hz_to_midi(f)))
+                crepe_chroma[midi_note % 12] += c
+        total = crepe_chroma.sum()
+        if total > 0:
+            crepe_chroma /= total
+    else:
+        return None  # not enough pitch info
 
-    # [12:24] Velocity-weighted chroma
-    vchroma = np.zeros(12)
-    for n, v in zip(notes, vels):
-        vchroma[n.pitch % 12] += v
-    vtotal = vchroma.sum()
-    if vtotal > 0:
-        vchroma /= vtotal
+    # 2. librosa CQT chroma (12-dim)
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
+    chroma_mean = chroma_cqt.mean(axis=1)
+    chroma_max = chroma_mean.max()
+    if chroma_max > 0:
+        chroma_mean /= chroma_max
 
-    # [24:30] Piano-specific features
-    lh = pitches[pitches < 60]  # left hand proxy: below C4
-    rh = pitches[pitches >= 60]  # right hand proxy: C4+
+    # 3. Spectral features (12-dim)
+    centroid = librosa.feature.spectral_centroid(y=y_win, sr=sr).mean() / 8000
+    bandwidth = librosa.feature.spectral_bandwidth(y=y_win, sr=sr).mean() / 4000
+    rolloff = librosa.feature.spectral_rolloff(y=y_win, sr=sr).mean() / 8000
+    zcr = librosa.feature.zero_crossing_rate(y_win).mean()
+    mfccs = librosa.feature.mfcc(y=y_win, sr=sr, n_mfcc=8).mean(axis=1)
+    # Normalize MFCCs to [0,1] range roughly
+    mfccs = np.clip((mfccs + 50) / 100, 0, 1)
 
-    piano_feats = np.array([
-        len(lh) / (len(pitches) + 1e-8),         # left-hand ratio
-        len(rh) / (len(pitches) + 1e-8),         # right-hand ratio
-        (pitches.max() - pitches.min()) / 48.0,   # range span (normalized)
-        (durs > 0.4).mean(),                       # sustained note ratio
-        vels.std() / 64.0,                         # dynamic variation
-        len(set(pitches % 12)) / 12.0,            # harmonic richness
-    ])
+    spectral = np.array([centroid, bandwidth, rolloff, zcr, *mfccs])
+    spectral = np.clip(spectral, 0, 1).astype(np.float32)
 
-    # [30:36] Temporal features
-    starts = np.array([n.start for n in notes])
-    intervals = np.diff(starts) if len(starts) > 1 else np.array([0.0])
-
-    temporal = np.array([
-        np.clip(intervals.mean(), 0, 1),           # avg note interval
-        np.clip(intervals.std(), 0, 1),            # interval variation
-        (intervals < 0.08).mean(),                  # rapid succession (run detection)
-        np.clip(durs.mean(), 0, 2) / 2.0,          # avg note duration
-        np.clip(durs.std(), 0, 1),                 # duration variation
-        np.clip(len(notes) / 30.0, 0, 1),          # note density
-    ])
-
-    feat = np.concatenate([chroma, vchroma, piano_feats, temporal])
-    return feat.astype(np.float32)
+    return np.concatenate([crepe_chroma, chroma_mean, spectral]).astype(np.float32)
 
 
-def estimate_chord(notes: list) -> str:
-    """Heuristic chord estimation from MIDI notes."""
+def _midi_window_to_chord(midi, t_start: float, t_end: float) -> str:
+    """Estimate chord label from MIDI notes in a time window."""
+    notes = []
+    for inst in midi.instruments:
+        if inst.is_drum:
+            continue
+        for n in inst.notes:
+            if n.start >= t_start and n.start < t_end:
+                notes.append(n)
+
+    if len(notes) < 3:
+        return "N"
+
     pitch_classes = [n.pitch % 12 for n in notes]
     counts = Counter(pitch_classes)
     root = counts.most_common(1)[0][0]
 
-    has_minor3 = (root + 3) % 12 in counts
-    has_major3 = (root + 4) % 12 in counts
-    has_dim5 = (root + 6) % 12 in counts
-    has_perf5 = (root + 7) % 12 in counts
-    has_aug5 = (root + 8) % 12 in counts
-    has_minor7 = (root + 10) % 12 in counts
-    has_major7 = (root + 11) % 12 in counts
+    has = {iv: (root + iv) % 12 in counts for iv in [3, 4, 6, 7, 8, 10, 11]}
 
-    if has_major7 and has_major3:
+    if has[11] and has[4]:
         quality = "maj7"
-    elif has_minor7 and has_minor3:
+    elif has[10] and has[3]:
         quality = "min7"
-    elif has_minor7 and has_major3:
+    elif has[10] and has[4]:
         quality = "7"
-    elif has_dim5 and has_minor3:
+    elif has[6] and has[3]:
         quality = "dim"
-    elif has_aug5 and has_major3:
+    elif has[8] and has[4]:
         quality = "aug"
-    elif has_minor3 and not has_major3:
+    elif has[3] and not has[4]:
         quality = "min"
-    elif not has_major3 and not has_minor3 and has_perf5:
+    elif not has[3] and not has[4] and has[7]:
         quality = "sus4"
     else:
         quality = "maj"
@@ -176,8 +237,105 @@ def estimate_chord(notes: list) -> str:
     return root_name if quality == "maj" else f"{root_name}{quality}"
 
 
-def generate_synthetic_supplement(samples_per_chord: int = 200) -> list[dict]:
-    """Generate synthetic chroma vectors for underrepresented chords."""
+def _get_maps_piano_type(dir_name: str) -> str:
+    """MAPS encodes recording condition in directory name."""
+    ambient_suffixes = ("Cl", "Bsdf", "BGCl", "Stgb")
+    return "ambient" if dir_name.endswith(ambient_suffixes) else "studio"
+
+
+# ══════════════════════════════════════════════════════════════════
+# Source 2: MAESTRO MIDI fallback (weaker — no real audio)
+# ══════════════════════════════════════════════════════════════════
+
+def process_maestro_midi(maestro_dir: Path, max_files: int = 200) -> list[dict]:
+    """Fallback: extract features from MIDI (no audio domain gap coverage).
+
+    Uses MIDI note info to synthesize chroma-like features.
+    Weaker than MAPS but available immediately.
+    """
+    import pretty_midi
+
+    samples = []
+    midi_files = list(maestro_dir.rglob("*.midi"))[:max_files]
+    logger.info(f"Processing MAESTRO MIDI fallback: {len(midi_files)} files")
+
+    for mf in midi_files:
+        try:
+            midi = pretty_midi.PrettyMIDI(str(mf))
+        except Exception:
+            continue
+
+        notes = []
+        for inst in midi.instruments:
+            if inst.program < 8 and not inst.is_drum:
+                notes.extend(inst.notes)
+        if len(notes) < 10:
+            continue
+
+        notes.sort(key=lambda n: n.start)
+        duration = midi.get_end_time()
+
+        t = 0.0
+        while t + 2.0 <= duration:
+            win_notes = [n for n in notes if n.start >= t and n.start < t + 2.0]
+            if len(win_notes) >= 4:
+                feat = _midi_notes_to_features(win_notes)
+                chord = _midi_window_to_chord(midi, t, t + 2.0)
+                if feat is not None and chord in LABEL_TO_IDX:
+                    samples.append({
+                        "features": feat.tolist(),
+                        "label_idx": LABEL_TO_IDX[chord],
+                        "label_str": chord,
+                        "track_id": mf.stem,
+                        "source": "maestro_midi",
+                        "piano_type": "midi",
+                    })
+            t += 0.5
+
+    return samples
+
+
+def _midi_notes_to_features(notes: list) -> np.ndarray | None:
+    """Synthesize 36-dim features from MIDI notes (no audio available)."""
+    pitches = np.array([n.pitch for n in notes])
+    vels = np.array([n.velocity for n in notes], dtype=float)
+
+    # Simulate CREPE chroma from MIDI pitches
+    crepe_chroma = np.zeros(12)
+    for p in pitches:
+        crepe_chroma[p % 12] += 1
+    total = crepe_chroma.sum()
+    if total > 0:
+        crepe_chroma /= total
+
+    # Simulate CQT chroma (add slight noise to differentiate from CREPE)
+    cqt_chroma = crepe_chroma.copy()
+    cqt_chroma += np.random.randn(12) * 0.03
+    cqt_chroma = np.maximum(cqt_chroma, 0)
+    cmax = cqt_chroma.max()
+    if cmax > 0:
+        cqt_chroma /= cmax
+
+    # Approximate spectral features from MIDI
+    durs = np.array([n.end - n.start for n in notes])
+    spectral = np.array([
+        np.mean(pitches) / 127,                         # ~ centroid
+        np.std(pitches) / 30,                            # ~ bandwidth
+        np.max(pitches) / 127,                           # ~ rolloff
+        np.clip(len(notes) / 30, 0, 1),                  # ~ ZCR proxy
+        *np.random.uniform(0.3, 0.7, 8),                 # ~ MFCCs (approximated)
+    ])
+    spectral = np.clip(spectral, 0, 1).astype(np.float32)
+
+    return np.concatenate([crepe_chroma, cqt_chroma, spectral]).astype(np.float32)
+
+
+# ══════════════════════════════════════════════════════════════════
+# Source 3: Synthetic data for rare chord classes
+# ══════════════════════════════════════════════════════════════════
+
+def generate_synthetic(samples_per_chord: int = 100) -> list[dict]:
+    """Generate synthetic features for underrepresented chord classes."""
     INTERVALS = {
         "maj": [0, 4, 7], "min": [0, 3, 7],
         "7": [0, 4, 7, 10], "maj7": [0, 4, 7, 11],
@@ -192,135 +350,189 @@ def generate_synthetic_supplement(samples_per_chord: int = 200) -> list[dict]:
             label = CLASSES[class_idx]
 
             for _ in range(samples_per_chord):
-                # Base chroma from intervals
-                chroma = np.zeros(12, dtype=np.float32)
+                # CREPE-like chroma
+                chroma1 = np.zeros(12, dtype=np.float32)
                 for iv in ivs:
-                    chroma[(root_idx + iv) % 12] = 1.0
-                chroma[root_idx] *= 1.5  # root emphasis
+                    chroma1[(root_idx + iv) % 12] = 1.0 + np.random.uniform(-0.1, 0.2)
+                chroma1[root_idx] *= 1.3
+                chroma1 = np.maximum(chroma1 + np.random.randn(12) * 0.08, 0)
+                s = chroma1.sum()
+                if s > 0:
+                    chroma1 /= s
 
-                # Add noise
-                noise = np.random.randn(12).astype(np.float32) * np.random.uniform(0.05, 0.25)
-                chroma = np.maximum(chroma + noise, 0)
-                total = chroma.sum()
-                if total > 0:
-                    chroma /= total
+                # CQT-like chroma (slightly different noise)
+                chroma2 = chroma1 + np.random.randn(12).astype(np.float32) * 0.05
+                chroma2 = np.maximum(chroma2, 0)
+                m = chroma2.max()
+                if m > 0:
+                    chroma2 /= m
 
-                # Duplicate as velocity-weighted (slightly different noise)
-                vchroma = chroma + np.random.randn(12).astype(np.float32) * 0.05
-                vchroma = np.maximum(vchroma, 0)
-                vtotal = vchroma.sum()
-                if vtotal > 0:
-                    vchroma /= vtotal
+                # Random spectral
+                spectral = np.random.uniform(0.1, 0.8, 12).astype(np.float32)
 
-                # Random piano features
-                piano_feats = np.array([
-                    np.random.uniform(0.2, 0.5),  # LH ratio
-                    np.random.uniform(0.5, 0.8),  # RH ratio
-                    np.random.uniform(0.3, 0.8),  # range
-                    np.random.uniform(0.2, 0.7),  # sustain
-                    np.random.uniform(0.1, 0.5),  # dynamics
-                    np.random.uniform(0.3, 0.9),  # richness
-                ], dtype=np.float32)
-
-                # Random temporal features
-                temporal = np.array([
-                    np.random.uniform(0.05, 0.3),
-                    np.random.uniform(0.02, 0.2),
-                    np.random.uniform(0.0, 0.3),
-                    np.random.uniform(0.1, 0.5),
-                    np.random.uniform(0.05, 0.3),
-                    np.random.uniform(0.3, 0.8),
-                ], dtype=np.float32)
-
-                feat = np.concatenate([chroma, vchroma, piano_feats, temporal])
+                feat = np.concatenate([chroma1, chroma2, spectral])
                 samples.append({
                     "features": feat.tolist(),
                     "label_idx": class_idx,
                     "label_str": label,
                     "track_id": f"synthetic_{label}",
-                    "t_start": 0.0,
+                    "source": "synthetic",
+                    "piano_type": "synthetic",
                 })
 
     return samples
 
 
+# ══════════════════════════════════════════════════════════════════
+# ChoCo → few-shot examples for Claude prompts
+# ══════════════════════════════════════════════════════════════════
+
+def process_choco_for_prompts():
+    """Extract chord progressions from ChoCo for Claude prompt few-shot examples."""
+    choco_path = DATA / "choco" / "piano_choco.json"
+    if not choco_path.exists():
+        logger.info("ChoCo not found — skipping few-shot extraction")
+        return
+
+    with open(choco_path) as f:
+        entries = json.load(f)
+
+    examples = []
+    for entry in entries:
+        chords = entry.get("chords", [])
+        if not isinstance(chords, list) or len(chords) < 4:
+            continue
+
+        # Extract 4-chord progressions
+        chord_labels = []
+        for c in chords:
+            if isinstance(c, dict) and "label" in c:
+                chord_labels.append(c["label"])
+            elif isinstance(c, str):
+                chord_labels.append(c)
+
+        for i in range(0, len(chord_labels) - 3, 2):
+            prog = chord_labels[i:i + 4]
+            if len(prog) == 4 and all(prog):
+                examples.append({
+                    "progression": prog,
+                    "source": entry.get("source", ""),
+                    "genre": entry.get("genre", ""),
+                    "title": entry.get("title", ""),
+                })
+
+    # Deduplicate by progression
+    seen = set()
+    unique = []
+    for ex in examples:
+        key = tuple(ex["progression"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(ex)
+
+    output = DATA / "chord_examples.json"
+    with open(output, "w") as f:
+        json.dump(unique[:2000], f, indent=1)
+
+    logger.info(f"ChoCo few-shot examples: {len(unique)} unique → saved {min(len(unique), 2000)}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# Main build pipeline
+# ══════════════════════════════════════════════════════════════════
+
 def build_dataset():
-    """Build piano_dataset.json from MAESTRO + optional GiantMIDI + synthetic."""
+    """Build training dataset from all available sources."""
     all_samples = []
 
-    # MAESTRO
+    # 1. MAPS — real audio (highest priority)
+    maps_dir = DATA / "maps"
+    if maps_dir.exists() and any(maps_dir.iterdir()):
+        maps_samples = process_maps(maps_dir)
+        all_samples.extend(maps_samples)
+        logger.info(f"MAPS: {len(maps_samples)} samples")
+    else:
+        logger.info("MAPS not found — will use MAESTRO MIDI fallback")
+
+    # 2. MAESTRO MIDI fallback (if MAPS insufficient)
     maestro_dir = DATA / "maestro" / "maestro-v3.0.0"
     if maestro_dir.exists():
-        midi_files = list(maestro_dir.rglob("*.midi"))
-        print(f"Processing MAESTRO: {len(midi_files)} files...")
-        for i, mf in enumerate(midi_files):
-            samples = midi_to_windows(str(mf))
-            all_samples.extend(samples)
-            if (i + 1) % 100 == 0:
-                print(f"  {i + 1}/{len(midi_files)} files, {len(all_samples)} samples so far...")
-    else:
-        print("MAESTRO not found — run: python download_data.py maestro")
+        # Use more MAESTRO samples if MAPS is missing/small
+        max_files = 50 if len(all_samples) > 5000 else 300
+        maestro_samples = process_maestro_midi(maestro_dir, max_files=max_files)
+        all_samples.extend(maestro_samples)
+        logger.info(f"MAESTRO fallback: {len(maestro_samples)} samples")
 
-    # GiantMIDI (optional)
-    giant_dir = DATA / "giantmidi"
-    if giant_dir.exists():
-        midi_files = list(giant_dir.glob("*.mid")) + list(giant_dir.glob("*.midi"))
-        print(f"Processing GiantMIDI: {len(midi_files)} files...")
-        for i, mf in enumerate(midi_files):
-            all_samples.extend(midi_to_windows(str(mf)))
-            if (i + 1) % 500 == 0:
-                print(f"  {i + 1}/{len(midi_files)} files...")
-
-    # Check class coverage and add synthetic for missing/rare chords
+    # 3. Synthetic supplement for rare chords
     class_counts = Counter(s["label_str"] for s in all_samples)
-    min_count = 50
-    underrepresented = [c for c in CLASSES if class_counts.get(c, 0) < min_count]
-
+    min_threshold = max(50, len(all_samples) // 500)
+    underrepresented = [c for c in CLASSES if class_counts.get(c, 0) < min_threshold]
     if underrepresented:
-        print(f"\n{len(underrepresented)} chord classes underrepresented, adding synthetic data...")
-        synthetic = generate_synthetic_supplement(samples_per_chord=200)
-        # Only add for underrepresented classes
+        synthetic = generate_synthetic(samples_per_chord=150)
         synthetic = [s for s in synthetic if s["label_str"] in underrepresented]
         all_samples.extend(synthetic)
-        print(f"  Added {len(synthetic)} synthetic samples")
+        logger.info(f"Synthetic supplement: {len(synthetic)} samples for {len(underrepresented)} rare classes")
 
     # Summary
     class_counts = Counter(s["label_str"] for s in all_samples)
+    source_counts = Counter(s["source"] for s in all_samples)
     unique_tracks = len(set(s["track_id"] for s in all_samples))
 
-    print(f"\n{'=' * 50}")
+    print(f"\n{'=' * 55}")
     print(f"Dataset built:")
     print(f"  Total samples:  {len(all_samples):,}")
     print(f"  Unique tracks:  {unique_tracks}")
-    print(f"  Chord classes:  {len(class_counts)}")
-    print(f"\nTop 20 chords:")
-    max_count = class_counts.most_common(1)[0][1] if class_counts else 1
-    for chord, n in class_counts.most_common(20):
-        bar_len = int(n / max_count * 30)
-        bar = "█" * bar_len
+    print(f"  Chord classes:  {len(class_counts)} / {len(CLASSES)}")
+    print(f"  Sources:        {dict(source_counts)}")
+    print(f"\nTop 15 chords:")
+    max_n = class_counts.most_common(1)[0][1] if class_counts else 1
+    for chord, n in class_counts.most_common(15):
+        bar = "█" * int(n / max_n * 25)
         print(f"  {chord:8s} {n:6,}  {bar}")
 
-    # Save
-    output_path = DATA / "piano_dataset.json"
-    DATA.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w") as f:
-        json.dump({
-            "instrument": "piano",
-            "feature_dim": 36,
-            "classes": CLASSES,
-            "n_classes": len(CLASSES),
-            "n_samples": len(all_samples),
-            "samples": all_samples,
-        }, f)
+    # Track-level split
+    _save_splits(all_samples)
 
-    size_mb = output_path.stat().st_size / 1_000_000
-    print(f"\nSaved: {output_path} ({size_mb:.1f} MB)")
+    # 4. ChoCo → few-shot examples (separate file)
+    process_choco_for_prompts()
+
+    print(f"\nDone!")
+
+
+def _save_splits(samples: list[dict]):
+    """Split by track ID to prevent data leakage."""
+    tracks = list(set(s["track_id"] for s in samples))
+    rng = np.random.default_rng(42)
+    rng.shuffle(tracks)
+    n = len(tracks)
+
+    val_tracks = set(tracks[:int(n * 0.15)])
+    test_tracks = set(tracks[int(n * 0.15):int(n * 0.25)])
+
+    splits = {
+        "train": [s for s in samples if s["track_id"] not in val_tracks | test_tracks],
+        "val": [s for s in samples if s["track_id"] in val_tracks],
+        "test": [s for s in samples if s["track_id"] in test_tracks],
+    }
+
+    DATA.mkdir(parents=True, exist_ok=True)
+    for split_name, split_data in splits.items():
+        output = DATA / f"piano_{split_name}.json"
+        with open(output, "w") as f:
+            json.dump({
+                "feature_dim": FEATURE_DIM,
+                "n_classes": len(CLASSES),
+                "classes": CLASSES,
+                "n_samples": len(split_data),
+                "samples": split_data,
+            }, f)
+        size_mb = output.stat().st_size / 1_000_000
+        print(f"  {split_name}: {len(split_data):,} samples ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Build piano chord dataset from MIDI")
-    parser.add_argument("--window", type=float, default=2.0, help="Window size in seconds")
-    parser.add_argument("--hop", type=float, default=0.5, help="Hop size in seconds")
+    parser = argparse.ArgumentParser(description="Build piano chord dataset")
+    parser.add_argument("--maps_only", action="store_true", help="Only process MAPS")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")

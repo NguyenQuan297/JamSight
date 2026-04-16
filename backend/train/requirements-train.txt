@@ -7,3 +7,7 @@ onnxruntime>=1.19.0
 librosa>=0.10.2
 numpy>=1.26.0
 soundfile>=0.12.1
+pretty-midi>=0.2.10
+crepe>=0.0.16
+datasets>=2.18.0
+tqdm>=4.66.0
