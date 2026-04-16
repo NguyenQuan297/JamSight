@@ -1,7 +1,11 @@
 """Audio analysis for piano performances.
 
-Pipeline: Video → FFmpeg → WAV → librosa + CREPE → chords/key/BPM
+Pipeline: Video → FFmpeg → WAV (16kHz) → CREPE + librosa → chords/key/BPM
 Optional: ONNX model for trained chord detection (replaces heuristic).
+
+IMPORTANT: Sample rate is 16000Hz everywhere (train + inference) because
+CREPE was trained at 16kHz. Using 22050Hz at inference would cause
+distribution shift in spectral features.
 """
 
 import subprocess
@@ -12,6 +16,9 @@ from pathlib import Path
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Consistent sample rate: CREPE trained at 16kHz, all features must match
+SAMPLE_RATE = 16000
 
 # Chord profiles: 12-dim chroma templates
 CHORD_TEMPLATES = {
@@ -58,7 +65,10 @@ class PianoChordPredictor:
             return True
 
         model_path = Path(__file__).parent.parent / "train" / "models" / "piano_model.onnx"
-        classes_path = Path(__file__).parent.parent / "train" / "data" / "piano_dataset.json"
+        # Try split file first (prepare_data.py output), then single file
+        classes_path = Path(__file__).parent.parent / "train" / "data" / "piano_train.json"
+        if not classes_path.exists():
+            classes_path = Path(__file__).parent.parent / "train" / "data" / "piano_dataset.json"
 
         if not model_path.exists():
             logger.info("ONNX model not found — using heuristic chord detection")
@@ -76,7 +86,6 @@ class PianoChordPredictor:
                     data = json.load(f)
                 self.classes = data["classes"]
             else:
-                # Fallback class list
                 chord_types = ["maj", "min", "7", "maj7", "min7", "dim", "aug", "sus4"]
                 self.classes = [
                     f"{r}" if t == "maj" else f"{r}{t}"
@@ -124,15 +133,46 @@ _predictor = PianoChordPredictor()
 
 
 # ──────────────────────────────────────────────
+# CREPE / pyin pitch detection (run once, reuse)
+# ──────────────────────────────────────────────
+
+def _run_crepe(y: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Run CREPE pitch detection, fallback to pyin if unavailable."""
+    try:
+        import crepe
+        time, freq, conf, _ = crepe.predict(y, sr, viterbi=True, step_size=50)
+        return time, freq, conf
+    except ImportError:
+        logger.info("CREPE not available, using librosa pyin fallback")
+        import librosa
+        f0, voiced, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr,
+                                      hop_length=int(sr * 0.05))
+        time = np.arange(len(f0)) * 0.05
+        freq = np.where(np.isnan(f0), 0, f0)
+        conf = voiced.astype(float)
+        return time, freq, conf
+
+
+def _pitches_from_crepe(crepe_freq: np.ndarray, crepe_conf: np.ndarray) -> list[float]:
+    """Extract MIDI note numbers from already-computed CREPE output."""
+    import librosa
+    valid = crepe_freq[crepe_conf > 0.7]
+    if len(valid) > 0:
+        midi = librosa.hz_to_midi(valid[valid > 0])
+        return [round(float(m), 1) for m in midi[:200]]
+    return []
+
+
+# ──────────────────────────────────────────────
 # Audio extraction and analysis
 # ──────────────────────────────────────────────
 
 def extract_audio(video_path: str) -> str:
-    """Extract mono 22050Hz WAV from video using FFmpeg."""
+    """Extract mono 16kHz WAV from video using FFmpeg."""
     wav_path = str(Path(video_path).with_suffix(".wav"))
     cmd = [
         "ffmpeg", "-i", video_path,
-        "-ac", "1", "-ar", "22050", "-vn",
+        "-ac", "1", "-ar", str(SAMPLE_RATE), "-vn",
         "-y", wav_path
     ]
     try:
@@ -146,10 +186,13 @@ def extract_audio(video_path: str) -> str:
 
 
 def analyze_audio(wav_path: str) -> dict:
-    """Analyze piano audio: detect chords, key, BPM, MIDI notes."""
+    """Analyze piano audio: detect chords, key, BPM, MIDI notes.
+
+    CREPE runs once and results are shared across chord detection and pitch extraction.
+    """
     import librosa
 
-    y, sr = librosa.load(wav_path, sr=22050)
+    y, sr = librosa.load(wav_path, sr=SAMPLE_RATE)
     duration = float(len(y) / sr)
     logger.info(f"Loaded audio: {duration:.1f}s at {sr}Hz")
 
@@ -157,22 +200,27 @@ def analyze_audio(wav_path: str) -> dict:
     tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
     bpm = int(round(float(np.atleast_1d(tempo)[0])))
 
-    # Chroma features
+    # Chroma features (for key estimation and heuristic fallback)
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
 
-    # Try ONNX model first, fallback to heuristic
+    # Run CREPE/pyin ONCE — reuse for both chord detection and pitch extraction
+    crepe_time, crepe_freq, crepe_conf = _run_crepe(y, sr)
+
+    # Chord detection
     _predictor.load()
     if _predictor.available:
-        chords = _detect_chords_onnx(y, sr)
+        chords = _detect_chords_onnx(y, sr, crepe_time, crepe_freq, crepe_conf)
     else:
         beat_times = librosa.frames_to_time(beat_frames, sr=sr)
         chords = _detect_chords_heuristic(chroma, sr, beat_times, y)
 
     chords = _deduplicate_consecutive(chords)
 
+    # Reuse CREPE output for pitch extraction (no second CREPE call)
+    midi_notes = _pitches_from_crepe(crepe_freq, crepe_conf)
+
     key = _estimate_key(chroma)
     time_sig = _estimate_time_signature(y, sr)
-    midi_notes = _detect_pitches(y, sr)
 
     return {
         "bpm": bpm,
@@ -208,13 +256,20 @@ def _extract_audio_window_features(
     if len(y_win) < sr * 0.5:
         return None
 
+    # 2. librosa CQT chroma (12-dim) — compute first for fallback
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
+    chroma_mean = chroma_cqt.mean(axis=1)
+    cmax = chroma_mean.max()
+    if cmax > 0:
+        chroma_mean /= cmax
+
     # 1. CREPE-based chroma (12-dim)
     mask = (crepe_time >= t_start) & (crepe_time < t_start + window) & (crepe_conf > 0.6)
     win_freq = crepe_freq[mask]
     win_conf = crepe_conf[mask]
 
     crepe_chroma = np.zeros(12)
-    if len(win_freq) >= 3:
+    if len(win_freq) >= 1:
         for f, c in zip(win_freq, win_conf):
             if f > 0:
                 midi_note = int(round(librosa.hz_to_midi(f)))
@@ -222,15 +277,10 @@ def _extract_audio_window_features(
         total = crepe_chroma.sum()
         if total > 0:
             crepe_chroma /= total
+        else:
+            crepe_chroma = chroma_mean.copy()  # fallback to CQT
     else:
-        return None
-
-    # 2. librosa CQT chroma (12-dim)
-    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
-    chroma_mean = chroma_cqt.mean(axis=1)
-    cmax = chroma_mean.max()
-    if cmax > 0:
-        chroma_mean /= cmax
+        crepe_chroma = chroma_mean.copy()  # fallback to CQT when no pitch data
 
     # 3. Spectral features (12-dim)
     centroid = librosa.feature.spectral_centroid(y=y_win, sr=sr).mean() / 8000
@@ -246,28 +296,11 @@ def _extract_audio_window_features(
     return np.concatenate([crepe_chroma, chroma_mean, spectral]).astype(np.float32)
 
 
-def _detect_chords_onnx(y: np.ndarray, sr: int) -> list[str]:
-    """Detect chords using ONNX model with audio-based features.
-
-    Uses the same feature extraction as the training pipeline:
-    CREPE chroma + CQT chroma + spectral features = 36-dim.
-    """
-    import librosa
-
-    # Run CREPE/pyin for pitch detection (same as training)
-    try:
-        import crepe
-        crepe_time, crepe_freq, crepe_conf, _ = crepe.predict(
-            y, sr, viterbi=True, step_size=50
-        )
-    except ImportError:
-        f0, voiced, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr,
-                                      hop_length=int(sr * 0.05))
-        crepe_time = np.arange(len(f0)) * 0.05
-        crepe_freq = np.where(np.isnan(f0), 0, f0)
-        crepe_conf = voiced.astype(float)
-
-    # Sliding window: extract audio features directly
+def _detect_chords_onnx(
+    y: np.ndarray, sr: int,
+    crepe_time: np.ndarray, crepe_freq: np.ndarray, crepe_conf: np.ndarray,
+) -> list[str]:
+    """Detect chords using ONNX model with pre-computed CREPE output."""
     duration = len(y) / sr
     window_sec = 2.0
     hop_sec = 1.0
@@ -396,29 +429,6 @@ def _estimate_time_signature(y: np.ndarray, sr: int) -> str:
     avg_4 = np.std(groups_of_4) if groups_of_4 else 999
 
     return "3/4" if avg_3 < avg_4 * 0.7 else "4/4"
-
-
-def _detect_pitches(y: np.ndarray, sr: int) -> list[float]:
-    """Detect prominent pitches as MIDI note numbers."""
-    import librosa
-
-    try:
-        import crepe
-        _, frequency, confidence, _ = crepe.predict(y, sr, viterbi=True, step_size=50)
-        valid = frequency[confidence > 0.7]
-        if len(valid) > 0:
-            midi = librosa.hz_to_midi(valid)
-            return [round(float(m), 1) for m in midi[:200]]
-    except ImportError:
-        logger.info("CREPE not available, using librosa pyin")
-
-    f0, voiced_flag, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr)
-    valid_f0 = f0[voiced_flag & ~np.isnan(f0)]
-    if len(valid_f0) > 0:
-        midi = librosa.hz_to_midi(valid_f0)
-        return [round(float(m), 1) for m in midi[:200]]
-
-    return []
 
 
 def _deduplicate_consecutive(chords: list[str]) -> list[str]:
