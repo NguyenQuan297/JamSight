@@ -41,38 +41,18 @@ Genre context is optionally enriched by the **ai-jam-sessions MCP server** — a
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────┐
-│                  React Frontend                        │
-│                                                        │
-│  VideoCapture   GenreSelector   ChordDisplay           │
-│  ChordPanel     SoloViewer      AnalyzeButton          │
-│  (canvas piano roll, Tone.js playback, MIDI export)    │
-└──────────────────────┬─────────────────────────────────┘
-                       │  /api/*  (Vite proxy)
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│                  FastAPI Backend                       │
-│                                                        │
-│  POST /api/analyze                                     │
-│    └─► audio_analyzer      chord · key · BPM           │
-│    └─► context_assembler   genre exemplar              │
-│    └─► ai_orchestrator     Claude chord + solo prompts │
-│    └─► midi_builder        2-track / 4-track MIDI      │
-│                                                        │
-│  POST /api/feedback   ──►  feedback_trainer (SQLite)   │
-│  GET  /api/download/* ──►  MIDI file stream            │
-│  GET  /api/genres     ──►  available genre list        │
-└──────────────────────┬─────────────────────────────────┘
-                       │  stdio (optional)
-                       ▼
-┌────────────────────────────────────────────────────────┐
-│          ai-jam-sessions MCP Server (Node.js)          │
-│  song_info()          genre exemplar text              │
-│  save_practice_note() session journal                  │
-│  (fallback to local context_assembler if unavailable)  │
-└────────────────────────────────────────────────────────┘
-```
+<img width="684" height="589" alt="image" src="https://github.com/user-attachments/assets/d5f7cc16-979b-440e-a635-8fde4ad22ad5" />
+
+
+---
+
+---
+
+## Data Flow
+
+<img width="646" height="470" alt="image" src="https://github.com/user-attachments/assets/d51abd2e-3959-483f-b38a-9059435d9335" />
+
+
 
 ---
 
