@@ -1,0 +1,9 @@
+torch>=2.2.0
+torchvision>=0.17.0
+matplotlib>=3.8.0
+scikit-learn>=1.4.0
+onnx>=1.16.0
+onnxruntime>=1.19.0
+librosa>=0.10.2
+numpy>=1.26.0
+soundfile>=0.12.1

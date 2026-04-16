@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+frontend/dist/
+frontend/node_modules/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+*.wav
+*.mid
+*.midi
+uploads/
+feedback.db
+
+# Models
+*.onnx
+*.pt
+*.pth
+checkpoints/
+
+# Docker
+docker-compose.override.yml
