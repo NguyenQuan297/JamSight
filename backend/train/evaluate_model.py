@@ -25,10 +25,11 @@ def load_pytorch_model(path: str, device: str = "cpu"):
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     feature_dim = ckpt.get("feature_dim", 36)
+    hidden_dim = ckpt.get("hidden_dim", 256)
     classes = ckpt.get("classes", [])
     num_classes = len(classes) if classes else 96
 
-    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes)
+    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes, hidden_dim=hidden_dim)
     model.load_state_dict(ckpt["state"])
     model.eval()
     model.to(device)

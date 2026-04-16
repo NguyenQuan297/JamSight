@@ -160,13 +160,20 @@ def _extract_audio_features(
     if len(y_win) < sr * 0.5:  # too short
         return None
 
+    # 2. librosa CQT chroma (12-dim) — compute first so we can fallback
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
+    chroma_mean = chroma_cqt.mean(axis=1)
+    chroma_max = chroma_mean.max()
+    if chroma_max > 0:
+        chroma_mean /= chroma_max
+
     # 1. CREPE-based chroma (12-dim)
     mask = (crepe_time >= t_start) & (crepe_time < t_start + window) & (crepe_conf > 0.6)
     win_freq = crepe_freq[mask]
     win_conf = crepe_conf[mask]
 
     crepe_chroma = np.zeros(12)
-    if len(win_freq) >= 3:
+    if len(win_freq) >= 1:
         for f, c in zip(win_freq, win_conf):
             if f > 0:
                 midi_note = int(round(librosa.hz_to_midi(f)))
@@ -174,15 +181,10 @@ def _extract_audio_features(
         total = crepe_chroma.sum()
         if total > 0:
             crepe_chroma /= total
+        else:
+            crepe_chroma = chroma_mean.copy()  # fallback to CQT
     else:
-        return None  # not enough pitch info
-
-    # 2. librosa CQT chroma (12-dim)
-    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
-    chroma_mean = chroma_cqt.mean(axis=1)
-    chroma_max = chroma_mean.max()
-    if chroma_max > 0:
-        chroma_mean /= chroma_max
+        crepe_chroma = chroma_mean.copy()  # fallback to CQT when no pitch data
 
     # 3. Spectral features (12-dim)
     centroid = librosa.feature.spectral_centroid(y=y_win, sr=sr).mean() / 8000
@@ -318,14 +320,24 @@ def _midi_notes_to_features(notes: list) -> np.ndarray | None:
     if cmax > 0:
         cqt_chroma /= cmax
 
-    # Approximate spectral features from MIDI
+    # Approximate spectral features from MIDI (deterministic, not random)
     durs = np.array([n.end - n.start for n in notes])
+    mean_pitch = np.mean(pitches)
+    pitch_std = np.std(pitches)
+    n_pitch_classes = len(set(pitches % 12))
     spectral = np.array([
-        np.mean(pitches) / 127,                         # ~ centroid
-        np.std(pitches) / 30,                            # ~ bandwidth
+        mean_pitch / 127,                                # ~ centroid
+        pitch_std / 30,                                  # ~ bandwidth
         np.max(pitches) / 127,                           # ~ rolloff
         np.clip(len(notes) / 30, 0, 1),                  # ~ ZCR proxy
-        *np.random.uniform(0.3, 0.7, 8),                 # ~ MFCCs (approximated)
+        np.min(pitches) / 127,                           # MFCC1 ~ register
+        n_pitch_classes / 12,                            # MFCC2 ~ harmonic richness
+        np.clip(durs.mean(), 0, 2) / 2,                  # MFCC3 ~ sustain
+        vels.std() / 64 if len(vels) > 1 else 0.5,      # MFCC4 ~ dynamics
+        np.clip(durs.std(), 0, 1),                       # MFCC5 ~ rhythmic variety
+        (pitches > 60).mean(),                           # MFCC6 ~ RH ratio
+        (durs > 0.4).mean(),                             # MFCC7 ~ sustained ratio
+        vels.mean() / 127,                               # MFCC8 ~ avg loudness
     ])
     spectral = np.clip(spectral, 0, 1).astype(np.float32)
 
@@ -351,7 +363,9 @@ def generate_synthetic(samples_per_chord: int = 100) -> list[dict]:
             class_idx = root_idx * len(CHORD_TYPES) + type_idx
             label = CLASSES[class_idx]
 
-            for _ in range(samples_per_chord):
+            root_norm = root_idx / 11.0
+
+            for sample_i in range(samples_per_chord):
                 # CREPE-like chroma
                 chroma1 = np.zeros(12, dtype=np.float32)
                 for iv in ivs:
@@ -369,15 +383,29 @@ def generate_synthetic(samples_per_chord: int = 100) -> list[dict]:
                 if m > 0:
                     chroma2 /= m
 
-                # Random spectral
-                spectral = np.random.uniform(0.1, 0.8, 12).astype(np.float32)
+                # Deterministic spectral based on chord properties
+                spectral = np.array([
+                    (root_idx * 4 + 40) / 127,                    # centroid ~ root register
+                    len(ivs) / 5,                                  # bandwidth ~ chord size
+                    (root_idx * 4 + 60) / 127,                    # rolloff ~ upper register
+                    np.random.uniform(0.2, 0.5),                   # ZCR
+                    root_norm,                                     # MFCC1 ~ tonal center
+                    float(len(ivs)) / 5,                           # MFCC2 ~ complexity
+                    1.0 if "maj" in ctype else 0.3,                # MFCC3 ~ brightness
+                    0.7 if "7" in ctype else 0.4,                  # MFCC4 ~ dissonance
+                    np.random.uniform(0.35, 0.65),                 # MFCC5
+                    np.random.uniform(0.35, 0.65),                 # MFCC6
+                    np.random.uniform(0.35, 0.65),                 # MFCC7
+                    np.random.uniform(0.35, 0.65),                 # MFCC8
+                ], dtype=np.float32)
+                spectral = np.clip(spectral, 0, 1)
 
                 feat = np.concatenate([chroma1, chroma2, spectral])
                 samples.append({
                     "features": feat.tolist(),
                     "label_idx": class_idx,
                     "label_str": label,
-                    "track_id": f"synthetic_{label}",
+                    "track_id": f"synthetic_{label}_{sample_i % 5}",
                     "source": "synthetic",
                     "piano_type": "synthetic",
                 })
@@ -460,7 +488,7 @@ def build_dataset():
     maestro_dir = DATA / "maestro" / "maestro-v3.0.0"
     if maestro_dir.exists():
         # Use more MAESTRO samples if MAPS is missing/small
-        max_files = 50 if len(all_samples) > 5000 else 300
+        max_files = 100 if len(all_samples) > 5000 else 600
         maestro_samples = process_maestro_midi(maestro_dir, max_files=max_files)
         all_samples.extend(maestro_samples)
         logger.info(f"MAESTRO fallback: {len(maestro_samples)} samples")

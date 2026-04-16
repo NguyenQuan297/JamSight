@@ -100,11 +100,12 @@ class PianoChordDataset(Dataset):
 class PianoMLP(nn.Module):
     """Piano chord classifier with residual connection.
 
-    Input:  (batch, 36) piano feature vector
-    Output: (batch, 96) logits
+    Input:  (batch, in_dim) piano feature vector
+    Output: (batch, num_classes) logits
     """
 
-    def __init__(self, in_dim: int = 36, num_classes: int = NUM_CLASSES):
+    def __init__(self, in_dim: int = 36, num_classes: int = NUM_CLASSES,
+                 hidden_dim: int = 256):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(in_dim, 128),
@@ -113,11 +114,11 @@ class PianoMLP(nn.Module):
             nn.Dropout(0.3),
         )
         self.hidden = nn.Sequential(
-            nn.Linear(128, 256),
-            nn.LayerNorm(256),
+            nn.Linear(128, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(256, 128),
+            nn.Linear(hidden_dim, 128),
             nn.LayerNorm(128),
             nn.GELU(),
         )
@@ -204,13 +205,47 @@ def train_model(config: dict) -> float:
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes).to(device)
+
+    hidden_dim = config.get("hidden_dim", 256)
+    model = PianoMLP(
+        in_dim=feature_dim, num_classes=num_classes, hidden_dim=hidden_dim,
+    ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=config["lr"], weight_decay=1e-4,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=config["epochs"],
-    )
+
+    # Scheduler selection
+    scheduler_type = config.get("scheduler", "cosine")
+    step_per_batch = False
+
+    if scheduler_type == "warmup_cosine":
+        total_steps = len(train_loader) * config["epochs"]
+        warmup_steps = total_steps // 10
+
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / max(warmup_steps, 1)
+            progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+            return max(0.0, 0.5 * (1.0 + np.cos(np.pi * progress)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        step_per_batch = True
+
+    elif scheduler_type == "onecycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config["lr"],
+            steps_per_epoch=len(train_loader),
+            epochs=config["epochs"],
+            pct_start=0.1,
+        )
+        step_per_batch = True
+
+    else:  # cosine (default)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config["epochs"],
+        )
+
     criterion = nn.CrossEntropyLoss(
         label_smoothing=config.get("label_smoothing", 0.1),
     )
@@ -224,7 +259,7 @@ def train_model(config: dict) -> float:
 
     best_acc = 0.0
     patience_counter = 0
-    max_patience = config.get("patience", 10)
+    max_patience = config.get("patience", 20)
 
     for epoch in range(config["epochs"]):
         # Train
@@ -238,7 +273,11 @@ def train_model(config: dict) -> float:
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             total_loss += loss.item()
-        scheduler.step()
+            if step_per_batch:
+                scheduler.step()
+
+        if not step_per_batch:
+            scheduler.step()
 
         # Validate
         model.eval()
@@ -270,7 +309,7 @@ def train_model(config: dict) -> float:
             torch.save(
                 {"state": model.state_dict(), "classes": classes,
                  "config": config, "best_acc": best_acc,
-                 "feature_dim": feature_dim},
+                 "feature_dim": feature_dim, "hidden_dim": hidden_dim},
                 str(model_path),
             )
         else:
@@ -287,9 +326,10 @@ def export_onnx(model_path: str, output_path: str = None):
     """Export trained model to ONNX for fast inference."""
     ckpt = torch.load(model_path, map_location="cpu")
     feature_dim = ckpt.get("feature_dim", 36)
+    hidden_dim = ckpt.get("hidden_dim", 256)
     num_classes = len(ckpt["classes"])
 
-    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes)
+    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes, hidden_dim=hidden_dim)
     model.load_state_dict(ckpt["state"])
     model.eval()
 
@@ -310,38 +350,53 @@ def export_onnx(model_path: str, output_path: str = None):
 def run_ablation():
     """Run 4 training configs and pick the best."""
     configs = [
-        {"name": "piano_mlp_full",
-         "lr": 3e-4, "epochs": 60, "label_smoothing": 0.1, "batch_size": 64},
-        {"name": "piano_mlp_no_smooth",
-         "lr": 3e-4, "epochs": 60, "label_smoothing": 0.0, "batch_size": 64},
-        {"name": "piano_mlp_high_lr",
-         "lr": 1e-3, "epochs": 60, "label_smoothing": 0.1, "batch_size": 64},
-        {"name": "piano_mlp_low_lr",
-         "lr": 1e-4, "epochs": 60, "label_smoothing": 0.1, "batch_size": 64},
+        # Baseline — cosine scheduler, standard size
+        {"name": "baseline",
+         "lr": 3e-4, "epochs": 100, "label_smoothing": 0.1,
+         "batch_size": 64, "hidden_dim": 256,
+         "augment": True, "scheduler": "cosine", "patience": 20},
+
+        # Warmup cosine — higher LR safe with warmup
+        {"name": "warmup",
+         "lr": 5e-4, "epochs": 120, "label_smoothing": 0.1,
+         "batch_size": 128, "hidden_dim": 256,
+         "augment": True, "scheduler": "warmup_cosine", "patience": 20},
+
+        # Wide model + warmup
+        {"name": "wide_warmup",
+         "lr": 5e-4, "epochs": 120, "label_smoothing": 0.1,
+         "batch_size": 128, "hidden_dim": 512,
+         "augment": True, "scheduler": "warmup_cosine", "patience": 20},
+
+        # OneCycleLR — fastest convergence
+        {"name": "onecycle",
+         "lr": 1e-3, "epochs": 100, "label_smoothing": 0.1,
+         "batch_size": 128, "hidden_dim": 512,
+         "augment": True, "scheduler": "onecycle", "patience": 20},
     ]
 
     results = []
     for cfg in configs:
-        print(f"\n{'=' * 50}")
-        print(f"Training: {cfg['name']}")
-        print(f"{'=' * 50}")
+        print(f"\n{'=' * 55}")
+        print(f"Config: {cfg['name']}")
+        print(f"{'=' * 55}")
         acc = train_model(cfg)
         results.append((cfg["name"], acc))
 
     # Summary
-    print(f"\n{'=' * 50}")
+    print(f"\n{'=' * 55}")
     print("ABLATION RESULTS")
-    print(f"{'=' * 50}")
+    print(f"{'=' * 55}")
     best_name, best_acc = max(results, key=lambda x: x[1])
     for name, acc in sorted(results, key=lambda x: -x[1]):
         marker = " <-- BEST" if name == best_name else ""
-        print(f"  {name:<28} {acc:.1%}{marker}")
+        print(f"  {name:<20} {acc:.1%}{marker}")
 
     # Export best to ONNX
     best_path = str(MODEL_DIR / f"{best_name}_best.pt")
     onnx_path = str(MODEL_DIR / "piano_model.onnx")
     export_onnx(best_path, onnx_path)
-    print(f"\nBest model exported to ONNX: {onnx_path}")
+    print(f"\nExported: {onnx_path}")
 
     return best_name, best_acc
 
