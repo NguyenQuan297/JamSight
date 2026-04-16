@@ -70,14 +70,14 @@ class MixupAugmentation:
         self.alpha = alpha
 
     def __call__(self, x1: torch.Tensor, y1: int,
-                 x2: torch.Tensor, y2: int) -> tuple[torch.Tensor, torch.Tensor]:
+                 x2: torch.Tensor, y2: int,
+                 num_classes: int = 96) -> tuple[torch.Tensor, torch.Tensor]:
         lam = np.random.beta(self.alpha, self.alpha)
 
         x_mixed = lam * x1 + (1 - lam) * x2
 
         # Soft labels
-        n_classes = 96
-        y_soft = torch.zeros(n_classes)
+        y_soft = torch.zeros(num_classes)
         y_soft[y1] = lam
         y_soft[y2] = 1 - lam
 

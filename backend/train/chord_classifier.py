@@ -75,7 +75,12 @@ class PianoChordDataset(Dataset):
         )
         self.augmenter = None
         if augment:
-            from augment import PianoAugmentation
+            try:
+                from augment import PianoAugmentation
+            except ImportError:
+                import sys
+                sys.path.insert(0, str(Path(__file__).parent))
+                from augment import PianoAugmentation
             self.augmenter = PianoAugmentation()
 
     def __len__(self):

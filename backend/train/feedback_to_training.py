@@ -172,7 +172,7 @@ def generate_incremental_training_data(
 
     This creates (chroma_vector, chord_label) pairs for incremental training.
     """
-    from chord_classifier import label_to_idx
+    from chord_classifier import label_to_idx, CHORD_TYPES
 
     chromas = []
     labels = []
@@ -187,7 +187,7 @@ def generate_incremental_training_data(
         for chord in progression:
             # Generate a synthetic chroma for this chord
             chord_idx = label_to_idx(chord)
-            root_idx = chord_idx // 8
+            root_idx = chord_idx // len(CHORD_TYPES)
 
             # Create idealized chroma
             chroma = np.zeros(12, dtype=np.float32)
