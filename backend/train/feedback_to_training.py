@@ -9,6 +9,7 @@ Supports:
 import argparse
 import json
 import logging
+import os
 import sqlite3
 from pathlib import Path
 
@@ -16,7 +17,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_DB = Path(__file__).parent.parent / "feedback.db"
+_BACKEND_DIR = Path(os.environ.get(
+    "JAMSIGHT_BACKEND_DIR",
+    Path(__file__).parent.parent,
+))
+DEFAULT_DB = _BACKEND_DIR / "jamsight_feedback.db"
 
 
 def load_feedback_db(db_path: str = None) -> list[dict]:
@@ -33,19 +38,24 @@ def load_feedback_db(db_path: str = None) -> list[dict]:
     ).fetchall()
     conn.close()
 
+    # Column names match feedback_trainer.py schema:
+    # id, session_id, genre, input_chords, suggestion_rank, suggestion, action, created_at
     entries = []
     for row in rows:
-        entries.append({
-            "id": row["id"],
-            "session_id": row["session_id"],
-            "input_progression": json.loads(row["input_progression"]),
-            "genre": row["genre"],
-            "suggestion": json.loads(row["suggestion_shown"]),
-            "rank": row["suggestion_rank"],
-            "action": row["user_action"],
-            "rating": row["rating"],
-            "created_at": row["created_at"],
-        })
+        try:
+            entries.append({
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "input_progression": json.loads(row["input_chords"]),
+                "genre": row["genre"],
+                "suggestion": json.loads(row["suggestion"]),
+                "rank": row["suggestion_rank"],
+                "action": row["action"],
+                "created_at": row["created_at"],
+            })
+        except (KeyError, json.JSONDecodeError) as e:
+            logger.debug(f"Skipping malformed row {row['id']}: {e}")
+            continue
 
     logger.info(f"Loaded {len(entries)} feedback entries from {db}")
     return entries
@@ -79,8 +89,6 @@ def feedback_to_preference_pairs(entries: list[dict]) -> list[dict]:
                     },
                     "chosen": acc["suggestion"],
                     "rejected": rej["suggestion"],
-                    "chosen_rating": acc.get("rating"),
-                    "rejected_rating": rej.get("rating"),
                 })
 
     logger.info(f"Generated {len(pairs)} DPO preference pairs")
@@ -118,10 +126,10 @@ def curate_few_shot_examples(
 
     curated = {}
     for genre, genre_entries in by_genre.items():
-        # Sort by rating (descending), then by frequency
+        # Sort by frequency (most recent first)
         sorted_entries = sorted(
             genre_entries,
-            key=lambda e: (e.get("rating") or 0, 1),
+            key=lambda e: e.get("created_at", ""),
             reverse=True,
         )
 
@@ -135,7 +143,6 @@ def curate_few_shot_examples(
                 unique.append({
                     "input_progression": entry["input_progression"],
                     "suggestion": entry["suggestion"],
-                    "rating": entry.get("rating"),
                 })
 
         curated[genre] = unique[:max_per_genre]

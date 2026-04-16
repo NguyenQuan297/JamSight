@@ -10,13 +10,15 @@ by providing studio AND ambient piano recordings with aligned MIDI.
 """
 
 import json
+import os
 import subprocess
 import sys
 import urllib.request
 import zipfile
 from pathlib import Path
 
-DATA = Path(__file__).parent / "data"
+_BASE = Path(os.environ.get("JAMSIGHT_TRAIN_DIR", Path(__file__).parent))
+DATA = _BASE / "data"
 
 
 # ══════════════════════════════════════════════════════════════════

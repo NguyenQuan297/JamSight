@@ -10,14 +10,29 @@ from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
 
+ROOTS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+
+
+def _chroma_to_chord_baseline(chroma_vec: np.ndarray) -> str:
+    """Simple baseline: strongest chroma bin = root, assume major."""
+    root_idx = int(chroma_vec[:12].argmax())
+    return ROOTS[root_idx]
+
 
 def load_pytorch_model(path: str, device: str = "cpu"):
     """Load a trained PyTorch chord classifier."""
-    from chord_classifier import ChordCNN, NUM_CLASSES
-    model = ChordCNN(num_classes=NUM_CLASSES)
-    model.load_state_dict(torch.load(path, map_location=device))
+    from chord_classifier import PianoMLP
+
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    feature_dim = ckpt.get("feature_dim", 36)
+    classes = ckpt.get("classes", [])
+    num_classes = len(classes) if classes else 96
+
+    model = PianoMLP(in_dim=feature_dim, num_classes=num_classes)
+    model.load_state_dict(ckpt["state"])
     model.eval()
-    return model
+    model.to(device)
+    return model, ckpt
 
 
 def load_onnx_model(path: str):
@@ -26,86 +41,136 @@ def load_onnx_model(path: str):
     return ort.InferenceSession(path)
 
 
-def evaluate_on_audio(model, audio_path: str) -> list[dict]:
+def evaluate_on_audio(model, audio_path: str, ckpt: dict) -> list[dict]:
     """Run chord detection on a real audio file using the trained model."""
     import librosa
     from chord_classifier import idx_to_label
 
-    y, sr = librosa.load(audio_path, sr=22050)
-    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=512)
+    y, sr = librosa.load(audio_path, sr=16000)
+    feature_dim = ckpt.get("feature_dim", 36)
 
-    # Segment by 2-second windows
-    hop = 512
-    window_frames = int(2.0 * sr / hop)
+    # Use CREPE/pyin for pitch detection
+    try:
+        import crepe
+        crepe_time, crepe_freq, crepe_conf, _ = crepe.predict(
+            y, sr, viterbi=True, step_size=50
+        )
+    except ImportError:
+        f0, voiced, _ = librosa.pyin(y, fmin=50, fmax=2000, sr=sr,
+                                      hop_length=int(sr * 0.05))
+        crepe_time = np.arange(len(f0)) * 0.05
+        crepe_freq = np.where(np.isnan(f0), 0, f0)
+        crepe_conf = voiced.astype(float)
+
+    duration = len(y) / sr
     results = []
 
-    for i in range(0, chroma.shape[1], window_frames):
-        segment = chroma[:, i:i + window_frames]
-        if segment.shape[1] == 0:
-            continue
+    t = 0.0
+    while t + 2.0 <= duration:
+        feat = _extract_eval_features(y, sr, t, 2.0,
+                                       crepe_time, crepe_freq, crepe_conf)
+        if feat is not None and len(feat) == feature_dim:
+            with torch.no_grad():
+                x = torch.tensor(feat).unsqueeze(0)
+                logits = model(x)
+                probs = torch.softmax(logits, dim=1)[0]
+                pred_idx = probs.argmax().item()
+                confidence = probs[pred_idx].item()
 
-        mean_chroma = segment.mean(axis=1).astype(np.float32)
-        total = mean_chroma.sum()
-        if total > 0:
-            mean_chroma /= total
-
-        # Predict
-        with torch.no_grad():
-            x = torch.tensor(mean_chroma).unsqueeze(0)
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1)[0]
-            pred_idx = probs.argmax().item()
-            confidence = probs[pred_idx].item()
-
-        time_start = i * hop / sr
-        time_end = min((i + window_frames) * hop / sr, len(y) / sr)
-
-        results.append({
-            "time_start": round(time_start, 2),
-            "time_end": round(time_end, 2),
-            "chord": idx_to_label(pred_idx),
-            "confidence": round(confidence, 3),
-        })
+            results.append({
+                "time_start": round(t, 2),
+                "time_end": round(t + 2.0, 2),
+                "chord": idx_to_label(pred_idx),
+                "confidence": round(confidence, 3),
+            })
+        t += 1.0
 
     return results
 
 
-def compare_with_baseline(model, test_dir: str, device: str = "cpu") -> dict:
-    """Compare trained model accuracy vs librosa chroma baseline."""
-    from chord_classifier import ChordDataset, idx_to_label
+def _extract_eval_features(y, sr, t_start, window,
+                            crepe_time, crepe_freq, crepe_conf) -> np.ndarray | None:
+    """Extract 36-dim features matching the training pipeline."""
+    import librosa
 
-    test_ds = ChordDataset(test_dir, "test")
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+    start_sample = int(t_start * sr)
+    end_sample = start_sample + int(window * sr)
+    y_win = y[start_sample:end_sample]
+    if len(y_win) < sr * 0.5:
+        return None
 
-    # Model predictions
+    # CREPE chroma (12-dim)
+    mask = (crepe_time >= t_start) & (crepe_time < t_start + window) & (crepe_conf > 0.6)
+    win_freq = crepe_freq[mask]
+    win_conf = crepe_conf[mask]
+
+    crepe_chroma = np.zeros(12)
+    if len(win_freq) >= 3:
+        for f, c in zip(win_freq, win_conf):
+            if f > 0:
+                midi_note = int(round(librosa.hz_to_midi(f)))
+                crepe_chroma[midi_note % 12] += c
+        s = crepe_chroma.sum()
+        if s > 0:
+            crepe_chroma /= s
+    else:
+        return None
+
+    # CQT chroma (12-dim)
+    chroma_cqt = librosa.feature.chroma_cqt(y=y_win, sr=sr, hop_length=512)
+    chroma_mean = chroma_cqt.mean(axis=1)
+    cmax = chroma_mean.max()
+    if cmax > 0:
+        chroma_mean /= cmax
+
+    # Spectral (12-dim)
+    centroid = librosa.feature.spectral_centroid(y=y_win, sr=sr).mean() / 8000
+    bandwidth = librosa.feature.spectral_bandwidth(y=y_win, sr=sr).mean() / 4000
+    rolloff = librosa.feature.spectral_rolloff(y=y_win, sr=sr).mean() / 8000
+    zcr = librosa.feature.zero_crossing_rate(y_win).mean()
+    mfccs = librosa.feature.mfcc(y=y_win, sr=sr, n_mfcc=8).mean(axis=1)
+    mfccs = np.clip((mfccs + 50) / 100, 0, 1)
+
+    spectral = np.array([centroid, bandwidth, rolloff, zcr, *mfccs])
+    spectral = np.clip(spectral, 0, 1).astype(np.float32)
+
+    return np.concatenate([crepe_chroma, chroma_mean, spectral]).astype(np.float32)
+
+
+def compare_with_baseline(model, device: str = "cpu") -> dict:
+    """Compare trained model accuracy vs argmax-chroma baseline on test set."""
+    from chord_classifier import PianoChordDataset, load_split, label_to_idx
+
+    test_s, _ = load_split("test")
+    test_loader = DataLoader(
+        PianoChordDataset(test_s, augment=False),
+        batch_size=64, shuffle=False,
+    )
+
     model.eval()
     model_correct = 0
     baseline_correct = 0
     total = 0
 
-    # Simple baseline: argmax of chroma vector → root, assume major
-    from services.audio_analyzer import _chroma_to_chord
-    from chord_classifier import label_to_idx
-
-    for chroma_batch, labels in test_loader:
-        # Model
+    for features, labels in test_loader:
+        # Model prediction
         with torch.no_grad():
-            logits = model(chroma_batch.to(device))
+            logits = model(features.to(device))
             model_preds = logits.argmax(dim=1).cpu()
             model_correct += (model_preds == labels).sum().item()
 
-        # Baseline: just pick the strongest chroma bin → assume major chord
-        for i in range(len(chroma_batch)):
-            chroma_vec = chroma_batch[i].numpy()
-            baseline_chord = _chroma_to_chord(chroma_vec)
+        # Baseline: argmax of first 12 dims (CREPE chroma) → assume major
+        for i in range(len(features)):
+            chroma_vec = features[i].numpy()
+            baseline_chord = _chroma_to_chord_baseline(chroma_vec)
             baseline_idx = label_to_idx(baseline_chord)
             if baseline_idx == labels[i].item():
                 baseline_correct += 1
 
         total += labels.size(0)
 
-    model_acc = model_correct / total * 100
-    baseline_acc = baseline_correct / total * 100
+    model_acc = model_correct / total * 100 if total > 0 else 0
+    baseline_acc = baseline_correct / total * 100 if total > 0 else 0
 
     return {
         "model_accuracy": round(model_acc, 2),
@@ -115,20 +180,23 @@ def compare_with_baseline(model, test_dir: str, device: str = "cpu") -> dict:
     }
 
 
-def per_class_metrics(model, test_dir: str, device: str = "cpu") -> dict:
+def per_class_metrics(model, device: str = "cpu") -> dict:
     """Compute per-chord-class precision, recall, F1."""
-    from chord_classifier import ChordDataset, NUM_CLASSES, idx_to_label
+    from chord_classifier import PianoChordDataset, load_split, idx_to_label, NUM_CLASSES
 
-    test_ds = ChordDataset(test_dir, "test")
-    test_loader = DataLoader(test_ds, batch_size=64, shuffle=False)
+    test_s, _ = load_split("test")
+    test_loader = DataLoader(
+        PianoChordDataset(test_s, augment=False),
+        batch_size=64, shuffle=False,
+    )
 
     all_preds = []
     all_labels = []
 
     model.eval()
     with torch.no_grad():
-        for chroma, labels in test_loader:
-            logits = model(chroma.to(device))
+        for features, labels in test_loader:
+            logits = model(features.to(device))
             preds = logits.argmax(dim=1).cpu()
             all_preds.extend(preds.tolist())
             all_labels.extend(labels.tolist())
@@ -145,10 +213,10 @@ def per_class_metrics(model, test_dir: str, device: str = "cpu") -> dict:
     return report
 
 
-def generate_report(model, test_dir: str, output_path: str = "evaluation_report.txt", device: str = "cpu"):
+def generate_report(model, output_path: str = "evaluation_report.txt", device: str = "cpu"):
     """Generate a full evaluation report."""
-    comparison = compare_with_baseline(model, test_dir, device)
-    metrics = per_class_metrics(model, test_dir, device)
+    comparison = compare_with_baseline(model, device)
+    metrics = per_class_metrics(model, device)
 
     lines = [
         "=" * 60,
@@ -158,13 +226,12 @@ def generate_report(model, test_dir: str, output_path: str = "evaluation_report.
         f"Total test samples: {comparison['total_samples']}",
         f"Model accuracy:    {comparison['model_accuracy']}%",
         f"Baseline accuracy: {comparison['baseline_accuracy']}%",
-        f"Improvement:       {comparison['improvement']}%",
+        f"Improvement:       +{comparison['improvement']}%",
         "",
         "Per-class metrics (top 20 by support):",
         "-" * 50,
     ]
 
-    # Sort classes by support
     class_metrics = [
         (name, data)
         for name, data in metrics.items()
@@ -200,7 +267,6 @@ def generate_report(model, test_dir: str, output_path: str = "evaluation_report.
 def main():
     parser = argparse.ArgumentParser(description="Evaluate chord classifier")
     parser.add_argument("--model_path", required=True, help="Path to .pt model")
-    parser.add_argument("--data_dir", default="data", help="Test data directory")
     parser.add_argument("--audio", default=None, help="Evaluate on a single audio file")
     parser.add_argument("--report", default="evaluation_report.txt")
     args = parser.parse_args()
@@ -208,15 +274,15 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    model = load_pytorch_model(args.model_path, device)
+    model, ckpt = load_pytorch_model(args.model_path, device)
 
     if args.audio:
-        results = evaluate_on_audio(model, args.audio)
+        results = evaluate_on_audio(model, args.audio, ckpt)
         for r in results:
             print(f"  [{r['time_start']:6.2f}s - {r['time_end']:6.2f}s] "
                   f"{r['chord']:8s} (conf={r['confidence']:.1%})")
     else:
-        generate_report(model, args.data_dir, args.report, device)
+        generate_report(model, args.report, device)
 
 
 if __name__ == "__main__":

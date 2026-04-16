@@ -17,6 +17,7 @@ Data sources:
 import argparse
 import json
 import logging
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -24,7 +25,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-DATA = Path(__file__).parent / "data"
+_BASE = Path(os.environ.get("JAMSIGHT_TRAIN_DIR", Path(__file__).parent))
+DATA = _BASE / "data"
 
 ROOTS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 CHORD_TYPES = ["maj", "min", "7", "maj7", "min7", "dim", "aug", "sus4"]

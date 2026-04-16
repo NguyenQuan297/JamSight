@@ -8,6 +8,7 @@ Ablation: runs 4 configs and picks the best.
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,12 +18,17 @@ from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = Path(__file__).parent / "data"
-MODEL_DIR = Path(__file__).parent / "models"
+_BASE = Path(os.environ.get("JAMSIGHT_TRAIN_DIR", Path(__file__).parent))
+DATA_DIR = _BASE / "data"
+MODEL_DIR = _BASE / "models"
 
 ROOTS = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 CHORD_TYPES = ["maj", "min", "7", "maj7", "min7", "dim", "aug", "sus4"]
 NUM_CLASSES = len(ROOTS) * len(CHORD_TYPES)  # 96
+CLASSES = [
+    r if t == "maj" else f"{r}{t}"
+    for r in ROOTS for t in CHORD_TYPES
+]
 
 
 def label_to_idx(label: str) -> int:
@@ -171,9 +177,14 @@ def train_model(config: dict) -> float:
     """Train one model with given config. Returns best validation accuracy."""
     train_s, train_meta = load_split("train")
     val_s, _ = load_split("val")
-    num_classes = train_meta.get("n_classes", NUM_CLASSES)
-    feature_dim = train_meta.get("feature_dim", 36)
-    logger.info(f"Split: train={len(train_s)}, val={len(val_s)}, feature_dim={feature_dim}")
+    classes = train_meta.get("classes", CLASSES)
+    num_classes = len(classes)
+    # Detect feature_dim from actual data, fallback to metadata, then 36
+    if train_s:
+        feature_dim = len(train_s[0]["features"])
+    else:
+        feature_dim = train_meta.get("feature_dim", 36)
+    logger.info(f"Split: train={len(train_s)}, val={len(val_s)}, feature_dim={feature_dim}, classes={num_classes}")
 
     # Weighted sampler
     sampler = make_weighted_sampler(train_s, num_classes)
@@ -252,7 +263,7 @@ def train_model(config: dict) -> float:
             patience_counter = 0
             MODEL_DIR.mkdir(parents=True, exist_ok=True)
             torch.save(
-                {"state": model.state_dict(), "classes": train_meta.get("classes", CLASSES),
+                {"state": model.state_dict(), "classes": classes,
                  "config": config, "best_acc": best_acc,
                  "feature_dim": feature_dim},
                 str(model_path),
