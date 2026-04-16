@@ -47,8 +47,6 @@ Genre context is optionally enriched by the **ai-jam-sessions MCP server** — a
 
 ---
 
----
-
 ## Data Flow
 
 <img width="1440" height="1020" alt="image" src="https://github.com/user-attachments/assets/f166c830-f750-407e-813e-d3220d5e23d6" />
