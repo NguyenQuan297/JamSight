@@ -41,7 +41,8 @@ Genre context is optionally enriched by the **ai-jam-sessions MCP server** — a
 
 ## Architecture
 
-<img width="684" height="589" alt="image" src="https://github.com/user-attachments/assets/d5f7cc16-979b-440e-a635-8fde4ad22ad5" />
+<img width="1440" height="1232" alt="image" src="https://github.com/user-attachments/assets/ab85a4b0-8c0a-4c89-9756-c53edae6eea7" />
+
 
 
 ---
@@ -50,7 +51,8 @@ Genre context is optionally enriched by the **ai-jam-sessions MCP server** — a
 
 ## Data Flow
 
-<img width="646" height="470" alt="image" src="https://github.com/user-attachments/assets/d51abd2e-3959-483f-b38a-9059435d9335" />
+<img width="1440" height="1020" alt="image" src="https://github.com/user-attachments/assets/f166c830-f750-407e-813e-d3220d5e23d6" />
+
 
 
 
