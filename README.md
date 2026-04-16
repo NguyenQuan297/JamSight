@@ -8,32 +8,8 @@ Upload a video of yourself playing piano — JamSight detects your chord progres
 
 ## How it works
 
-```
-MP4 upload
-    │
-    ▼
-FFmpeg  ──►  audio WAV
-                │
-                ▼
-            librosa chroma  ──►  chord / key / BPM detection
-            CREPE pitch         (ONNX PianoChordPredictor, 96 classes)
-            ONNX model          fallback to heuristic if no model
-                │
-                ├──► context_assembler  ──►  genre exemplar + piano voicings
-                │         │
-                │         ▼
-                └──► Claude Sonnet API
-                          │
-                          ├──► 3 chord reharmonizations
-                          │    (LH shell voicings + RH extensions + voice leading)
-                          │
-                          └──► 8-bar two-hand piano solo
-                               (RH melody C4–C7 + LH bass C2–C4)
-                                    │
-                                    ▼
-                               pretty_midi  ──►  2-track MIDI download
-                               Tone.js      ──►  browser playback
-```
+<img width="1440" height="1250" alt="image" src="https://github.com/user-attachments/assets/05d31f83-09ab-40a5-b9b5-4be0fda09ab6" />
+
 
 Genre context is optionally enriched by the **ai-jam-sessions MCP server** — a library of 120 annotated songs used as musical reference for Claude's prompts.
 
